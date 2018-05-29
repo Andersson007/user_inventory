@@ -7,7 +7,7 @@
 # Author: Andrey Klychkov (aaklychkov@mail.ru)
 # Version: see __VERSION__
 # Licence: Copyleft free software
-# Date: 2018-05-27
+# Date: 2018-05-29
 
 import argparse
 import getpass

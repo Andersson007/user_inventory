@@ -6,7 +6,6 @@ Version: 1.1
 
 Date: 2018-05-29
 
-
 ### Requirements:
 ```Python3+, paramiko, OpenSSH server on destination hosts, works with Linux only```
 
