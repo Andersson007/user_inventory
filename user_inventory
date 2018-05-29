@@ -1,0 +1,368 @@
+#!/usr/bin/python3
+# Name: user_inventory.py
+# Description: show user and group information on hosts
+# Requirements: Python3+, paramiko
+# Note: works with Linux systems only
+#
+# Author: Andrey Klychkov (aaklychkov@mail.ru)
+# Version: see __VERSION__
+# Licence: Copyleft free software
+# Date: 2018-05-27
+
+import argparse
+import getpass
+import re
+import sys
+
+try:
+    import paramiko
+    assert paramiko
+except ImportError as e:
+    print(e, "Hint: use pip3 install paramiko")
+    sys.exit(1)
+
+
+__VERSION__ = '1.1'
+
+
+###########################################
+#    Parsing of command-line arguments    #
+###########################################
+def parse_cli_args():
+    parser = argparse.ArgumentParser(
+        description="Script for users inventory")
+
+    parser.add_argument("-u", "--user", dest="user",
+                        help="ssh user to connect", metavar="USER",
+                        required=True)
+    parser.add_argument("-p", "--port", dest="port",
+                        help="ssh port to connect", metavar="PORT",
+                        required=False, default=22)
+    parser.add_argument("--hosts-file", dest="hosts_file",
+                        help="alternative 'hosts' ini file "
+                        "('hosts' in current dir by default)",
+                        metavar="HOSTS_FILE")
+    parser.add_argument("--min-uid", dest="min_uid",
+                        help="min user uid for inventory",
+                        metavar='UID')
+    parser.add_argument("--csv", dest="csv_view",
+                        help="view in csv format",
+                        action='store_true')
+
+    hosts = parser.add_mutually_exclusive_group()
+    hosts.add_argument("--host-group", dest="host_group",
+                       help="host group from 'hosts' file for inventory",
+                       metavar="HOST_GROUP", required=False, default='all')
+    hosts.add_argument("--host", dest="host",
+                       help="inventory of specified host",
+                       metavar="HOSTNAME")
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--show-users", dest="show_users",
+                       action="store_true",
+                       help="show users on hosts")
+    group.add_argument("--check-user", dest="check_user", metavar="USERNAME",
+                       help="check user on hosts")
+    group.add_argument("--check-group", dest="check_group",
+                       metavar="GROUPNAME",
+                       help="check group on hosts")
+    group.add_argument("--version", action="version",
+                       version=__VERSION__, help="show version and exit")
+    return parser.parse_args()
+
+
+args = parse_cli_args()
+
+
+#######################
+#    Set up params    #
+#######################
+if args.hosts_file:
+    HOSTS_FILE = args.hosts_file
+else:
+    HOSTS_FILE = 'hosts'
+
+PASSWORD = getpass.getpass("ssh password: ")
+PORT = args.port
+USER = args.user
+
+if args.host_group:
+    INVENTORY_GROUP = args.host_group
+else:
+    INVENTORY_GROUP = 'all'
+
+
+###############################
+#    FUNCTIONS AND CLASSES    #
+###############################
+def exec_via_ssh(host, cmd):
+    """Connect to host via ssh and exec cmd
+    """
+    paramiko.util.log_to_file('paramiko.log')
+
+    ssh = paramiko.SSHClient()
+    ssh.load_system_host_keys()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        ssh.connect(host, PORT, USER, PASSWORD)
+    except paramiko.ssh_exception.AuthenticationException:
+        print('%s: connection failed, permission denied' % host)
+        return ([], [])
+    except KeyboardInterrupt:
+        print(' ...interrupted. Exit')
+        sys.exit(1)
+
+    stdin, stdout, stderr = ssh.exec_command(cmd)
+    out = stdout.readlines()
+    err = stderr.readlines()
+    ssh.close()
+    return (out, err)
+
+
+class HostParser():
+    """Parse inventory file (like ansible format)
+       and make dictionary {group_name: [hosts]}
+    """
+    def __init__(self):
+        self.host_dict = {}
+
+    def read(self, host_file):
+        g_flag = False
+        group_section = re.compile('^\[.*\]')
+        comment = re.compile('^#|^\s#')
+
+        for line in open(host_file):
+            if comment.search(line):
+                continue
+
+            if ':' in line:
+                continue
+
+            if group_section.search(line):
+                group = line.strip('\n][')
+                self.host_dict[group] = []
+                g_flag = True
+                continue
+
+            if g_flag:
+                if line != '\n' and line and not group_section.search(line):
+                    host = line.strip(' \t\n')
+                    self.host_dict[group].append(host)
+                else:
+                    g_flag = False
+
+
+class HandleStat():
+    """Base class of stat handlers
+    """
+    def print_title(self, hostname):
+        """Print title for pretty (not csv) view
+        """
+        title = "host: %s" % (hostname)
+        sep = "=" * len(title)
+        print("%s\n%s\n%s" % (sep, title, sep))
+
+
+class HandleListUsers(HandleStat):
+    """Class to handle output of list of users statistics.
+       It's a subsidiary class for ListUsers() class.
+       Allows pretty (by default) or csv output format
+    """
+    def __init__(self, stat_dict):
+        self.stat_dict = stat_dict
+
+    def show(self, csv=False):
+        system_users = re.compile('system|chrony|nfsnobody|polkitd')
+
+        for host in self.stat_dict:
+            if not self.stat_dict[host]:
+                continue
+
+            user_array = self.stat_dict[host]
+
+            if not csv:
+                self.print_title(host)
+
+            for line in user_array:
+                if system_users.search(line):
+                    continue
+
+                line = line.split(':')
+                line[-1] = line[-1].rstrip('\n')
+
+                if csv:
+                    print('%s,%s' % (host, ','.join(line)))
+                else:
+                    username = line[0]
+                    uid = line[1]
+                    shell = line[2].rstrip('\n')
+                    if 'nologin' not in shell:
+                        print('{:{}{}}{:{}{}}'.format(username, '<', '16',
+                                                      uid, '<', '8'))
+                    else:
+                        print('{:{}{}}{:{}{}}{}'.format(username, '<', '16',
+                                                        uid, '<', '8', shell))
+
+
+class HandleUserInfo(HandleStat):
+    """Class to handle output of user statistics.
+       It's a subsidiary class for UserInfo() class.
+       Allows pretty (by default) or csv output format
+    """
+    def __init__(self, stat_dict):
+        self.stat_dict = stat_dict
+
+    def show(self, csv=False):
+        for host in self.stat_dict:
+            if not self.stat_dict[host]:
+                continue
+
+            line = self.stat_dict[host][0].split()
+            user = line[0].split('(')[1].rstrip(')')
+            uid = line[0].split('=')[1].split('(')[0]
+            groups = line[2]
+            groups = groups.split('=')[1]
+
+            if csv:
+                print('%s,%s,%s,%s' % (host, user, uid, groups))
+            else:
+                print(host, user, uid, groups)
+
+
+class HandleGroupInfo(HandleStat):
+    """Class to handle output of group statistics.
+       It's a subsidiary class for GroupInfo() class.
+       Allows pretty (by default) or csv output format
+    """
+    def __init__(self, stat_dict):
+        self.stat_dict = stat_dict
+
+    def show(self, csv=False):
+        for host in self.stat_dict:
+            if not self.stat_dict[host]:
+                continue
+
+            if csv:
+                group_info = self.stat_dict[host][0]
+                group_info = group_info.replace(':', ',').rstrip('\n')
+                print('%s,%s' % (host, group_info))
+            else:
+                group_info = self.stat_dict[host][0].split(':')
+                members = group_info[1]
+                print('host:%s group:%s members:%s' % (
+                      host, group_info[0], members), end='')
+
+
+class StatBase(object):
+    """Base class of inventory classes
+    """
+    def __init__(self, host_file, host_group):
+        host_parser = HostParser()
+        host_parser.read(host_file)
+        self.host_dict = host_parser.host_dict
+        self.handled_hosts = []
+        self.get_stat_cmd = ''
+        self.stat = {}
+        self.csv_view = False
+        if host_group == 'all':
+            self.groups_to_handle = list(self.host_dict.keys())
+        elif host_group in self.host_dict:
+            self.groups_to_handle = [host_group]
+        else:
+            print('No such host group in the hosts file')
+            sys.exit(1)
+
+    def set_csv_view(self):
+        self.csv_view = True
+
+    def limit_host(self, hostname):
+        self.host_dict = {'single_host': [hostname]}
+        self.host_group = 'single_host'
+        self.groups_to_handle = ['single_host']
+
+    def do_stat(self):
+        for group in self.groups_to_handle:
+            for host in self.host_dict[group]:
+                if host in self.handled_hosts:
+                    continue
+
+                result = exec_via_ssh(host, self.get_stat_cmd)
+
+                self.stat[host] = result[0]
+                self.handled_hosts.append(host)
+
+
+class ListUsers(StatBase):
+    """Class to get and handle list of users from remote hosts.
+       Uses a composition with HandleListUsers() class
+    """
+    def __init__(self, host_file, host_group):
+        super().__init__(host_file, host_group)
+        self.min_uid = 500
+
+    def set_min_uid(self, num):
+        self.min_uid = int(num)
+
+    def get_info(self):
+        self.get_stat_cmd = "awk -F':' '{if ($3>=%s) "\
+                            "print $1 \":\" $3 \":\" $7}' "\
+                            "/etc/passwd" % self.min_uid
+        self.do_stat()
+        handler = HandleListUsers(self.stat)
+        handler.show(csv=self.csv_view)
+
+
+class UserInfo(StatBase):
+    """Class to get and handle user info from remote hosts.
+       Uses a composition with HandleUserInfo() class
+    """
+    def __init__(self, host_file, host_group, username):
+        super().__init__(host_file, host_group)
+        self.get_stat_cmd = "id "+username
+
+    def get_info(self):
+        self.do_stat()
+        handler = HandleUserInfo(self.stat)
+        handler.show(csv=self.csv_view)
+
+
+class GroupInfo(StatBase):
+    """Class to get and handle group info from remote hosts.
+       Uses a composition with HandleGroupInfo() class
+    """
+    def __init__(self, host_file, host_group, groupname):
+        super().__init__(host_file, host_group)
+        self.get_stat_cmd = "awk -F':' '$1==\"%s\" {print}' "\
+                            "/etc/group | cut -f1,4 -d':'" % groupname
+
+    def get_info(self):
+        self.do_stat()
+        handler = HandleGroupInfo(self.stat)
+        handler.show(csv=self.csv_view)
+
+
+def main():
+    if args.show_users:
+        stat = ListUsers(HOSTS_FILE, INVENTORY_GROUP)
+
+        if args.min_uid:
+            stat.set_min_uid(args.min_uid)
+
+    elif args.check_user:
+        stat = UserInfo(HOSTS_FILE, INVENTORY_GROUP, args.check_user)
+
+    elif args.check_group:
+        stat = GroupInfo(HOSTS_FILE, INVENTORY_GROUP, args.check_group)
+
+    if args.csv_view:
+        stat.set_csv_view()
+
+    if args.host:
+        stat.limit_host(args.host)
+
+    stat.get_info()
+
+
+if __name__ == '__main__':
+    main()
