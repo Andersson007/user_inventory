@@ -1,0 +1,7 @@
+[centos7]
+hostname1
+192.168.0.1
+
+[postgres10]
+hostname1
+hostname2
